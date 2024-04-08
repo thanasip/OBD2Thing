@@ -9,10 +9,12 @@ namespace ODB2Thing
 {
     internal class Program
     {
+        private const int INIT_DELAY = 200;
+
         private static List<int> _supportedPids = [];
         private static Dictionary<byte, Type> _pidTypes = [];
         private static int _maxPidNameLen = 0;
-        private static bool _firstResponse = true;
+        private static bool _sentATZ = false;
         private static string _prompt = string.Empty;
 
         static async Task Main()
@@ -32,11 +34,9 @@ namespace ODB2Thing
             if (string.IsNullOrWhiteSpace(com))
                 throw new Exception("Invalid COM port");
 
-            using var conn = new SerialConnection(com.ToUpper(), 115200, Parity.None, StopBits.One, Handshake.None, 2000);
-            using var obd2 = new ELM327(conn);
-
-            obd2.SubscribeDataReceived<IOBDData>((sender, response)
-                => Console.WriteLine($"RECEIVED DATA: {response.Data} (PID: {response.Data.PID})\n"));
+            using var conn = new SerialConnection(com.ToUpper(), 115200, Parity.None, StopBits.One, Handshake.None, 5000);
+            using SerialDevice serial = new ELM327(conn);
+            await serial.InitializeAsync();
 
             conn.DataReceived += (data, args) =>
             {
@@ -45,14 +45,19 @@ namespace ODB2Thing
 
                 //Console.WriteLine($"BYTE: {asHex}");
                 Console.WriteLine($"TEXT: {asStr}\n");
-                if (_firstResponse)
+                if (_sentATZ)
                 {
-                    _firstResponse = false;
+                    _sentATZ = false;
                     _prompt = asStr.Replace("\\r", string.Empty)[..^1];
                 }
             };
 
-            obd2.Initialize();
+            using ELM327 obd2 = (ELM327)serial;
+            await PerformInitSequence(obd2);
+
+            obd2.SubscribeDataReceived<IOBDData>((sender, response)
+                => Console.WriteLine($"RECEIVED DATA: {response.Data} (PID: {response.Data.PID})\n"));
+
             await GetSupportedPids(obd2);
 
             string? command = string.Empty;
@@ -106,7 +111,7 @@ namespace ODB2Thing
         static void PrintPIDTableRow(Type pid, int index)
         {
             Console.WriteLine($"│{pid.Name.PadRight(_maxPidNameLen)} │{_supportedPids[index],4} │");
-            if (index < _supportedPids.Count - 2)
+            if (index < _supportedPids.Count - 1)
                 Console.WriteLine($"├{new string('─', _maxPidNameLen)}─┼─────┤");
         }
 
@@ -127,10 +132,33 @@ namespace ODB2Thing
 
         static bool GetInput(ref string? command)
         {
+            Task.Delay(INIT_DELAY).GetAwaiter().GetResult();
             Console.Write($"{_prompt} > ");
             var res = !string.IsNullOrWhiteSpace(command = Console.ReadLine()?.ToUpper());
             Console.WriteLine();
             return res;
+        }
+
+        static async Task PerformInitSequence(ELM327 obd2)
+        {
+            obd2.SendCommand(ATCommand.ResetDevice);
+            await Task.Delay(INIT_DELAY);
+            _sentATZ = true;
+
+            obd2.SendCommand(ATCommand.EchoOff);
+            await Task.Delay(INIT_DELAY);
+
+            obd2.SendCommand(ATCommand.LinefeedsOff);
+            await Task.Delay(INIT_DELAY);
+
+            obd2.SendCommand(ATCommand.HeadersOff);
+            await Task.Delay(INIT_DELAY);
+
+            obd2.SendCommand(ATCommand.PrintSpacesOff);
+            await Task.Delay(INIT_DELAY);
+
+            obd2.SendCommand(ATCommand.SetProtocolAuto);
+            await Task.Delay(INIT_DELAY);
         }
 
         static async Task GetSupportedPids(ELM327 obd2)
@@ -144,12 +172,19 @@ namespace ODB2Thing
             obd2.SubscribeDataReceived<PidsSupportedC1_E0>((sender, response) => _supportedPids.AddRange(response.Data.SupportedPids));
 
             await RequestData<PidsSupported01_20>(obd2);
+            await Task.Delay(INIT_DELAY);
             await RequestData<PidsSupported21_40>(obd2);
+            await Task.Delay(INIT_DELAY);
             await RequestData<PidsSupported41_60>(obd2);
+            await Task.Delay(INIT_DELAY);
             await RequestData<PidsSupported61_80>(obd2);
+            await Task.Delay(INIT_DELAY);
             await RequestData<PidsSupported81_A0>(obd2);
+            await Task.Delay(INIT_DELAY);
             await RequestData<PidsSupportedA1_C0>(obd2);
+            await Task.Delay(INIT_DELAY);
             await RequestData<PidsSupportedC1_E0>(obd2);
+            await Task.Delay(INIT_DELAY);
 
             obd2.UnsubscribeDataReceived<PidsSupported01_20>((sender, response) => { });
             obd2.UnsubscribeDataReceived<PidsSupported21_40>((sender, response) => { });
