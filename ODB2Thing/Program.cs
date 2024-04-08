@@ -9,20 +9,19 @@ namespace ODB2Thing
 {
     internal class Program
     {
-        private static readonly List<int> _supportedPids = [];
-        private static readonly Dictionary<byte, Type> _pidTypes = [];
+        private static List<int> _supportedPids = [];
+        private static Dictionary<byte, Type> _pidTypes = [];
+        private static int _maxPidNameLen = 0;
+        private static bool _firstResponse = true;
+        private static string _prompt = string.Empty;
 
         static async Task Main()
         {
-            typeof(IOBDData).Assembly
+            _pidTypes = typeof(IOBDData).Assembly
                 .GetTypes()
                 .Where(t => t?.BaseType == typeof(AbstractOBDData) && !t.IsAbstract)
-                .ToList()
-                .ForEach(t =>
-                {
-                    if (Activator.CreateInstance(t) is IOBDData inst)
-                        _pidTypes.TryAdd(inst.PID, t);
-                });
+                .OrderBy(t => (Activator.CreateInstance(t) as IOBDData)?.PID)
+                .ToDictionary(t => (Activator.CreateInstance(t) as IOBDData)?.PID ?? 0);
 
             SerialConnection.GetAvailablePorts()
                 .ToList()
@@ -46,6 +45,11 @@ namespace ODB2Thing
 
                 //Console.WriteLine($"BYTE: {asHex}");
                 Console.WriteLine($"TEXT: {asStr}\n");
+                if (_firstResponse)
+                {
+                    _firstResponse = false;
+                    _prompt = asStr.Replace("\\r", string.Empty)[..^1];
+                }
             };
 
             obd2.Initialize();
@@ -58,13 +62,15 @@ namespace ODB2Thing
                 {
                     break;
                 }
-                else if (command.Equals("pids", StringComparison.CurrentCultureIgnoreCase))
+                else if (command.Equals("pids", StringComparison.CurrentCultureIgnoreCase) && _supportedPids.Count > 0)
                 {
-                    foreach (var pid in _pidTypes)
+                    PrintPIDTableHeader();
+                    for (var i = 0; i < _supportedPids.Count; i++)
                     {
-                        if (_supportedPids.Contains(pid.Key))
-                            Console.WriteLine($"{pid.Value.Name}: ({pid.Key})");
+                        if (_pidTypes.TryGetValue((byte)_supportedPids[i], out var pid))
+                            PrintPIDTableRow(pid, i);
                     }
+                    PrintPIDTableFooter();
                 }
                 else
                 {
@@ -80,13 +86,32 @@ namespace ODB2Thing
                         if (byte.TryParse(command, out var pid))
                         {
                             if (_supportedPids.Contains(pid))
+                            {
                                 await RequestData(pid, obd2);
+                                await obd2.WaitQueueAsync();
+                            }
                         }
-                        await obd2.WaitQueueAsync();
                     }
                 }
             }
         }
+
+        static void PrintPIDTableHeader()
+        {
+            Console.WriteLine($"┌{new string('─', _maxPidNameLen)}─┬─────┐");
+            Console.WriteLine($"│{"TYPE".PadRight(_maxPidNameLen)} │ PID │");
+            Console.WriteLine($"├{new string('─', _maxPidNameLen)}─┼─────┤");
+        }
+
+        static void PrintPIDTableRow(Type pid, int index)
+        {
+            Console.WriteLine($"│{pid.Name.PadRight(_maxPidNameLen)} │{_supportedPids[index],4} │");
+            if (index < _supportedPids.Count - 2)
+                Console.WriteLine($"├{new string('─', _maxPidNameLen)}─┼─────┤");
+        }
+
+        static void PrintPIDTableFooter()
+            => Console.WriteLine($"└{new string('─', _maxPidNameLen)}─┴─────┘\n");
 
         static string ELMDataToHexString(DataReceivedEventArgs? args)
             => string.Join(' ', args?.Data?.Take(args?.Count ?? 0)?.Select(b => $"{b:X2}") ?? []);
@@ -102,7 +127,7 @@ namespace ODB2Thing
 
         static bool GetInput(ref string? command)
         {
-            Console.Write("ready > ");
+            Console.Write($"{_prompt} > ");
             var res = !string.IsNullOrWhiteSpace(command = Console.ReadLine()?.ToUpper());
             Console.WriteLine();
             return res;
@@ -133,6 +158,18 @@ namespace ODB2Thing
             obd2.UnsubscribeDataReceived<PidsSupported81_A0>((sender, response) => { });
             obd2.UnsubscribeDataReceived<PidsSupportedA1_C0>((sender, response) => { });
             obd2.UnsubscribeDataReceived<PidsSupportedC1_E0>((sender, response) => { });
+
+            _supportedPids.ForEach(p =>
+            {
+                if (_pidTypes.TryGetValue((byte)p, out var type))
+                {
+                    var pidNameLen = type.Name.Length;
+                    if (pidNameLen > _maxPidNameLen)
+                        _maxPidNameLen = pidNameLen;
+                }
+            });
+
+            _supportedPids.Sort();
         }
 
         static async Task RequestData<T>(ELM327 obd2) where T : class, IOBDData, new()
