@@ -54,7 +54,7 @@ namespace ODB2Thing
             string? command = string.Empty;
             while (GetInput(ref command) && command is not null)
             {
-                if (command.Equals("q", StringComparison.CurrentCultureIgnoreCase))
+                if (command.Equals("quit", StringComparison.CurrentCultureIgnoreCase))
                 {
                     break;
                 }
