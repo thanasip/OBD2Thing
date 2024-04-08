@@ -4,61 +4,116 @@ using OBD.NET.Devices;
 using OBD.NET.Extensions;
 using OBD.NET.OBDData;
 using System.IO.Ports;
+using System.Text.RegularExpressions;
 
 namespace ODB2Thing
 {
     internal class Program
     {
-        private static int[] _bank1Pids = [];
-        private static int[] _bank2Pids = [];
-        private static int[] _bank3Pids = [];
+        private static readonly List<int> _supportedPids = [];
+        private static readonly Dictionary<byte, Type> _pidTypes = [];
 
         static async Task Main()
         {
-            using var conn = new SerialConnection("COM4", 115200, Parity.None, StopBits.One, Handshake.None, 2000);
+            typeof(IOBDData).Assembly
+                .GetTypes()
+                .Where(t => t?.BaseType == typeof(AbstractOBDData) && !t.IsAbstract)
+                .ToList()
+                .ForEach(t =>
+                {
+                    if (Activator.CreateInstance(t) is IOBDData inst)
+                        _pidTypes.TryAdd(inst.PID, t);
+                });
+
+            Console.WriteLine("Enter COM port number: ");
+            var comNum = Console.ReadLine();
+            if (!uint.TryParse(comNum, out var comInt))
+                throw new Exception("Invalid COM port");
+
+            using var conn = new SerialConnection($"COM{comInt}", 115200, Parity.None, StopBits.One, Handshake.None, 2000);
             using var obd2 = new ELM327(conn);
 
+            SerialConnection.GetAvailablePorts().ToList().ForEach(s => Console.WriteLine($"Available COM port: {s}"));
+
             obd2.SubscribeDataReceived<IOBDData>((sender, response)
-                => Console.WriteLine($"RECEIVED: PID {response.Data.PID.ToHexString()}: {response.Data}"));
+                => Console.WriteLine($"RECEIVED DATA: {response.Data} (PID: {response.Data.PID})"));
+
+            conn.DataReceived += (data, args) =>
+            {
+                var asHex = string.Join(' ', args?.Data?.Where(b => b != 0)?.Select(b => $"{b:X2}") ?? []);
+                //var asStr = Regex.Escape(string.Join("", args?.Data?.Where(b => b is not 0)?.Select(b => (char)b) ?? []));
+                Console.WriteLine($"BYTE: {asHex}");
+                //Console.WriteLine($"TEXT: {asStr}");
+            };
 
             await obd2.InitializeAsync();
+            await Task.Delay(7000);
             await GetSupportedPids(obd2);
             string? command = string.Empty;
-
-            while (!string.IsNullOrWhiteSpace(command = Console.ReadLine()))
+            while (GetInput(ref command) && command is not null)
             {
-                if (!command.Equals("q", StringComparison.CurrentCultureIgnoreCase))
+                if (command.Equals("q", StringComparison.CurrentCultureIgnoreCase))
+                {
+                    break;
+                }
+                else if (command.Equals("pids", StringComparison.CurrentCultureIgnoreCase))
+                {
+                    foreach (var pid in _pidTypes)
+                    {
+                        if (_supportedPids.Contains(pid.Key))
+                            Console.WriteLine($"{pid.Value.Name}: ({pid.Key})");
+                    }
+                }
+                else
                 {
                     var atCommand = ResolveCommand(command);
 
                     if (atCommand != null)
+                    {
                         obd2.SendCommand(atCommand);
+                    }
+                    else
+                    {
+                        if (byte.TryParse(command, out var pid))
+                        {
+                            if (_supportedPids.Contains(pid))
+                                await RequestData(pid, obd2);
+                        }
+                    }
                 }
             }
 
             Console.ReadLine();
         }
 
+        static bool GetInput(ref string? command)
+        {
+            Console.Write("ready > ");
+            return !string.IsNullOrWhiteSpace(command = Console.ReadLine());
+        }
+
         static async Task GetSupportedPids(ELM327 obd2)
         {
-            obd2.SubscribeDataReceived<PidsSupported01_20>((sender, response) => _bank1Pids = response.Data.SupportedPids);
-            obd2.SubscribeDataReceived<PidsSupported21_40>((sender, response) => _bank2Pids = response.Data.SupportedPids);
-            obd2.SubscribeDataReceived<PidsSupported41_60>((sender, response) => _bank3Pids = response.Data.SupportedPids);
+            obd2.SubscribeDataReceived<PidsSupported01_20>((sender, response) => _supportedPids.AddRange(response.Data.SupportedPids));
 
             await RequestData<PidsSupported01_20>(obd2);
-            await RequestData<PidsSupported21_40>(obd2);
-            await RequestData<PidsSupported41_60>(obd2);
 
-            obd2.UnsubscribeDataReceived<PidsSupported01_20>((sender, response) => _bank1Pids = response.Data.SupportedPids);
-            obd2.UnsubscribeDataReceived<PidsSupported21_40>((sender, response) => _bank2Pids = response.Data.SupportedPids);
-            obd2.UnsubscribeDataReceived<PidsSupported41_60>((sender, response) => _bank3Pids = response.Data.SupportedPids);
+            obd2.UnsubscribeDataReceived<PidsSupported01_20>((sender, response) => { });
         }
 
         static async Task RequestData<T>(ELM327 obd2) where T : class, IOBDData, new()
         {
             Console.WriteLine($"Requesting data for PID: {typeof(T).Name} ({new T().PID})");
             await obd2.RequestDataAsync<T>();
-            await Task.Delay(1000);
+            await obd2.WaitQueueAsync();
+        }
+
+        static async Task RequestData(byte pid, ELM327 obd2)
+        {
+            var type = _pidTypes[pid];
+            Console.WriteLine($"Requesting data for PID: {type.Name} ({pid})");
+            await obd2.RequestDataAsync(type);
+            await obd2.WaitQueueAsync();
         }
 
         static ATCommand? ResolveCommand(string command) => command switch
